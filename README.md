@@ -5,7 +5,11 @@
 
 2. Load apptainer: `module load apptainer`
 
-3. Build container: `apptainer build simplerenv.sif simplerenv.def`
+2a. For octo inference, use simplerenv-octo.def
+2b. For rt-1-x inference, use simplerenv-rt1x
+
+
+3. Build container: `apptainer build simplerenv.sif simplerenv-[your-model].def`
 
 4. Start container `apptainer shell --nv --writable-tmpfs simplerenv.sif`
 
@@ -13,3 +17,7 @@
    If there's an error at this step, try restarting the container or trying a different GPU node
 
 6. Run script: `python example.py`
+example.py currently has code for running octo inference. It needs to be adjusted to also return action-dimension entropy. 
+
+
+
