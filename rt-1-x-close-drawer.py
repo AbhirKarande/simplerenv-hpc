@@ -238,51 +238,73 @@ for episode_id in range(50):
         # Get the image (use single image now)
         image = get_image_from_maniskill2_obs_dict(env, obs) # Use single image
 
-        # --- Perform a single inference ---
-        try:
-            # Pass the single image (H, W, 3)
-            raw_action, action, action_info = model.step(image)
-        except ValueError:
-            # Handle models that might not return action_info
-            raw_action, action = model.step(image)
-            action_info = None
+        # --- Perform multiple inferences ---
+        all_raw_actions = []
+        all_actions = []
+        all_action_infos = []
+        
+        for inference_idx in range(5):
+            try:
+                # Pass the single image (H, W, 3)
+                raw_action, action, action_info = model.step(image)
+            except ValueError:
+                # Handle models that might not return action_info
+                raw_action, action = model.step(image)
+                action_info = None
+                
+            all_raw_actions.append(raw_action)
+            all_actions.append(action)
+            all_action_infos.append(action_info)
 
         # Cleanup the image used for inference
         del image
 
         # Store data for logging (convert to serializable format)
-        serializable_raw_action = ensure_serializable(raw_action)
-        serializable_action = ensure_serializable(action)
+        serializable_raw_actions = [ensure_serializable(ra) for ra in all_raw_actions]
+        serializable_actions = [ensure_serializable(a) for a in all_actions]
 
         # Extract optional info like entropy, log_probs, token_argmax for logging
         token_argmax_data = []
-        token_entropy_data = [] # Renamed from token_entropy_by_inference for clarity
-        if action_info:
-            if 'entropy' in action_info:
+        token_entropy_data = []
+        
+        # Process action info from all inferences
+        per_dimension_entropies = []  # List to store entropy for each dimension across inferences
+        
+        for action_info in all_action_infos:
+            if action_info and 'entropy' in action_info:
                 entropy_data = ensure_serializable(action_info['entropy'])
                 if isinstance(entropy_data, list) and len(entropy_data) > 0:
-                    token_entropy_data.append(entropy_data[0]) # Store first horizon entropy
+                    # Store entropy for each dimension
+                    per_dimension_entropies.append(entropy_data)
+                    token_entropy_data.append(entropy_data[0])  # Keep existing behavior for backward compatibility
 
-            if 'token_argmax' in action_info:
-                 token_argmax_val = ensure_serializable(action_info['token_argmax'])
-                 if isinstance(token_argmax_val, list) and len(token_argmax_val) > 0:
-                    token_argmax_data.append(token_argmax_val[0]) # Store first horizon argmax
+        # Calculate average entropy for each dimension across inferences
+        avg_dimension_entropies = None
+        if per_dimension_entropies:
+            # Convert to numpy array for easier averaging
+            entropy_array = np.array(per_dimension_entropies)
+            avg_dimension_entropies = np.mean(entropy_array, axis=0).tolist()
 
-        # --- Use the single processed action to step Environment ---
-        # Ensure action components are numpy arrays before concatenation
-        world_vector = np.array(action["world_vector"])
-        rot_axangle = np.array(action["rot_axangle"])
-        gripper = np.array(action["gripper"])
+        # --- Use the averaged processed action to step Environment ---
+        # Average the action components across all 5 inferences
+        world_vectors = np.array([action["world_vector"] for action in all_actions])
+        rot_axangles = np.array([action["rot_axangle"] for action in all_actions])
+        grippers = np.array([action["gripper"] for action in all_actions])
 
-        combined_action = np.concatenate([world_vector, rot_axangle, gripper])
+        # Calculate averages
+        avg_world_vector = np.mean(world_vectors, axis=0)
+        avg_rot_axangle = np.mean(rot_axangles, axis=0)
+        avg_gripper = np.mean(grippers, axis=0)
+
+        # Use the averaged components for the environment step
+        combined_action = np.concatenate([avg_world_vector, avg_rot_axangle, avg_gripper])
         obs, reward, terminated, truncated, info = env.step(combined_action)
 
         # --- Cleanup action components and combined action ---
-        del world_vector, rot_axangle, gripper, combined_action
-        # Raw action and processed action are needed for logging below
-        # if raw_action: del raw_action
-        # if action: del action
-        if action_info: del action_info
+        del world_vectors, rot_axangles, grippers
+        del avg_world_vector, avg_rot_axangle, avg_gripper
+        del combined_action
+        del all_raw_actions, all_actions, all_action_infos
 
         # Get info from environment (ensure they're Python native types)
         is_grasped = bool(info.get("is_grasped", False))
@@ -302,9 +324,20 @@ for episode_id in range(50):
         # Store timestep data in the format shown in the JSON snippet
         timestep_data = {
             "timestep": timestep,
-            # Store the single action components used to step the env
-            "action_components": serializable_action,
-            "raw_action": serializable_raw_action,   # Log the raw action
+            # Store all 5 action components
+            "all_action_components": serializable_actions,
+            "all_raw_actions": serializable_raw_actions,
+            # Store the averaged action components
+            "averaged_action_components": {
+                "world_vector": ensure_serializable(avg_world_vector),
+                "rot_axangle": ensure_serializable(avg_rot_axangle),
+                "gripper": ensure_serializable(avg_gripper)
+            },
+            # Add entropy information
+            "entropy_info": {
+                "per_inference_entropies": per_dimension_entropies,  # List of entropies for each inference
+                "averaged_dimension_entropies": avg_dimension_entropies  # Average entropy for each dimension
+            },
             "info": {
                 "elapsed_steps": elapsed_steps,
                 "is_grasped": is_grasped,
