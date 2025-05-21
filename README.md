@@ -15,8 +15,16 @@ Prerequisites: You have a directory in HPC that has the example.py and a contain
 
 4. Start container `apptainer shell --nv --writable-tmpfs simplerenv.sif`
 
+4a. Run the following: 
+1.-----   `. /opt/miniconda/etc/profile.d/conda.sh`
+2.-----   `conda activate simpler_env`
+
+
 5. Test vulkan: `vulkaninfo | head -n 5`
    If there's an error at this step, try restarting the container or trying a different GPU node
+
+
+
 
 6. Run script: `python example.py`
 example.py currently has code for running octo inference. It needs to be adjusted to also return action-dimension entropy. 

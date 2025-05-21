@@ -75,7 +75,7 @@ download_all_rt_1_checkpoints()
 
 # @title Select your model and environment
 
-task_name = "google_robot_move_near"  # @param ["google_robot_pick_coke_can", "google_robot_move_near", "google_robot_open_drawer", "google_robot_close_drawer", "widowx_spoon_on_towel", "widowx_carrot_on_plate", "widowx_stack_cube", "widowx_put_eggplant_in_basket"]
+task_name = "google_robot_close_drawer"  # @param ["google_robot_pick_coke_can", "google_robot_move_near", "google_robot_open_drawer", "google_robot_close_drawer", "widowx_spoon_on_towel", "widowx_carrot_on_plate", "widowx_stack_cube", "widowx_put_eggplant_in_basket"]
 
 if 'env' in locals():
   print("Closing existing env")
@@ -99,7 +99,7 @@ else:
   policy_setup = "widowx_bridge"
  
 # @title Select your model and environment
-model_name = "octo-base" # @param ["rt_1_x", "rt_1_400k", "rt_1_58k", "rt_1_1k", "octo-base", "octo-small"]
+model_name = "rt_1_x" # @param ["rt_1_x", "rt_1_400k", "rt_1_58k", "rt_1_1k", "octo-base", "octo-small"]
 
 if "rt_1" in model_name:
   from simpler_env.policies.rt1.rt1_model import RT1Inference
