@@ -267,6 +267,17 @@ for episode_id in range(50):
         token_argmax_data = []
         token_entropy_data = []
         
+        # --- Use the averaged processed action to step Environment ---
+        # Average the action components across all 5 inferences
+        world_vectors = np.array([action["world_vector"] for action in all_actions])
+        rot_axangles = np.array([action["rot_axangle"] for action in all_actions])
+        grippers = np.array([action["gripper"] for action in all_actions])
+
+        # Calculate averages
+        avg_world_vector = np.mean(world_vectors, axis=0)
+        avg_rot_axangle = np.mean(rot_axangles, axis=0)
+        avg_gripper = np.mean(grippers, axis=0)
+
         # Process action info from all inferences
         per_dimension_entropies = []  # List to store entropy for each dimension across inferences
         
@@ -285,26 +296,9 @@ for episode_id in range(50):
             entropy_array = np.array(per_dimension_entropies)
             avg_dimension_entropies = np.mean(entropy_array, axis=0).tolist()
 
-        # --- Use the averaged processed action to step Environment ---
-        # Average the action components across all 5 inferences
-        world_vectors = np.array([action["world_vector"] for action in all_actions])
-        rot_axangles = np.array([action["rot_axangle"] for action in all_actions])
-        grippers = np.array([action["gripper"] for action in all_actions])
-
-        # Calculate averages
-        avg_world_vector = np.mean(world_vectors, axis=0)
-        avg_rot_axangle = np.mean(rot_axangles, axis=0)
-        avg_gripper = np.mean(grippers, axis=0)
-
         # Use the averaged components for the environment step
         combined_action = np.concatenate([avg_world_vector, avg_rot_axangle, avg_gripper])
         obs, reward, terminated, truncated, info = env.step(combined_action)
-
-        # --- Cleanup action components and combined action ---
-        del world_vectors, rot_axangles, grippers
-        del avg_world_vector, avg_rot_axangle, avg_gripper
-        del combined_action
-        del all_raw_actions, all_actions, all_action_infos
 
         # Get info from environment (ensure they're Python native types)
         is_grasped = bool(info.get("is_grasped", False))
@@ -358,7 +352,11 @@ for episode_id in range(50):
 
         episode_data.append(timestep_data)
 
-
+        # --- Cleanup action components and combined action ---
+        del world_vectors, rot_axangles, grippers
+        del avg_world_vector, avg_rot_axangle, avg_gripper
+        del combined_action
+        del all_raw_actions, all_actions, all_action_infos
 
     # Save this episode's data to a separate JSON file in the folder
     episode_file_path = os.path.join(output_folder, f'episode_{episode_id}_data.json')
