@@ -285,26 +285,23 @@ for episode_id in range(50):
             if action_info and 'entropy' in action_info:
                 entropy_data = ensure_serializable(action_info['entropy'])
                 if isinstance(entropy_data, list) and len(entropy_data) > 0:
-                    # Store entropy for each dimension
-                    per_dimension_entropies.append(entropy_data)
-                    token_entropy_data.append(entropy_data[0])  # Keep existing behavior for backward compatibility
+                    # Get first horizon (index 0) and first 7 values (action dimensions)
+                    first_horizon_entropies = entropy_data[0][:7]  # Take first 7 values from first horizon
+                    per_dimension_entropies.append(first_horizon_entropies)
+                    token_entropy_data.append(first_horizon_entropies)  # Keep existing behavior for backward compatibility
 
         # Calculate average entropy for each dimension across inferences
         avg_dimension_entropies = None
         if per_dimension_entropies:
             # Convert to numpy array for easier averaging
-            entropy_array = np.array(per_dimension_entropies)
-            avg_dimension_entropies = np.mean(entropy_array, axis=0).tolist()
+            entropy_array = np.array(per_dimension_entropies)  # Shape: (5, 7) - 5 inferences, 7 dimensions
+            avg_dimension_entropies = np.mean(entropy_array, axis=0).tolist()  # Average across inferences
 
         # Use the averaged components for the environment step
         combined_action = np.concatenate([avg_world_vector, avg_rot_axangle, avg_gripper])
         obs, reward, terminated, truncated, info = env.step(combined_action)
 
-        # --- Cleanup action components and combined action ---
-        del world_vectors, rot_axangles, grippers
-        del avg_world_vector, avg_rot_axangle, avg_gripper
-        del combined_action
-        del all_raw_actions, all_actions, all_action_infos
+
 
         # Get info from environment (ensure they're Python native types)
         is_grasped = bool(info.get("is_grasped", False))
@@ -357,6 +354,12 @@ for episode_id in range(50):
             timestep_data["token_entropy"] = token_entropy_data
 
         episode_data.append(timestep_data)
+
+                # --- Cleanup action components and combined action ---
+        del world_vectors, rot_axangles, grippers
+        del avg_world_vector, avg_rot_axangle, avg_gripper
+        del combined_action
+        del all_raw_actions, all_actions, all_action_infos
 
 
 
