@@ -1,0 +1,109 @@
+Bootstrap: docker
+From: nvidia/cuda:11.8.0-runtime-ubuntu20.04
+
+%post
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Basic setup
+    apt-get update && apt-get install -y \
+        tzdata \
+        wget \
+        git \
+        curl \
+        nano \
+        sudo \
+        vim \
+        net-tools \
+        iputils-ping \
+        unzip \
+        xvfb \
+        ca-certificates \
+        libcurl4-openssl-dev \
+        libglib2.0-0 \
+        ffmpeg \
+        apt-transport-https \
+        gnupg \
+        python3 \
+        python3-pip \
+        cuda-toolkit-11-8 \
+        nvidia-cuda-toolkit
+
+    # CUDA environment variables
+    echo 'export PATH=/usr/local/cuda-11.8/bin:${PATH}' >> $SINGULARITY_ENVIRONMENT
+    echo 'export LD_LIBRARY_PATH=/usr/local/cuda-11.8/lib64:${LD_LIBRARY_PATH}' >> $SINGULARITY_ENVIRONMENT
+
+    ln -fs /usr/share/zoneinfo/America/Los_Angeles /etc/localtime
+    dpkg-reconfigure --frontend noninteractive tzdata
+
+    # Vulkan and OpenGL setup
+    apt-get install -y \
+        mesa-utils \
+        mesa-vulkan-drivers \
+        libvulkan1 \
+        vulkan-tools \
+        vulkan-utils \
+        libgl1-mesa-glx \
+        libglu1-mesa \
+        libglx-mesa0 \
+        libegl1-mesa \
+        libglvnd-dev \
+        libglu1-mesa-dev \
+        freeglut3-dev \
+        libgl1-mesa-dev
+
+    # Install Miniconda
+    wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
+    bash /tmp/miniconda.sh -b -f -p /opt/miniconda
+    rm /tmp/miniconda.sh
+
+    # Conda setup
+    . /opt/miniconda/etc/profile.d/conda.sh
+
+    # Create conda env
+    conda create -n simpler_env python=3.10 -y
+    conda activate simpler_env
+
+    # Install SimplerEnv
+    cd /opt
+    git clone https://github.com/AbhirKarande/SimplerEnv-Communicative --recurse-submodules
+    cd SimplerEnv-Communicative/ManiSkill2_real2sim
+    pip install -e .
+
+    cd ..
+    pip install -e .
+    pip install -r requirements_full_install.txt
+
+    pip install numpy==1.24.4
+    pip install tensorflow==2.15.0
+    pip install -r requirements_full_install.txt
+    pip install tensorflow[and-cuda]==2.15.1 # tensorflow gpu support
+
+    # Octo setup
+    cd /opt
+    git clone https://github.com/AbhirKarande/octo/
+    cd octo
+    git checkout diffusion-probs
+    pip install -e .
+
+    # Google Cloud CLI setup
+    curl https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" > /etc/apt/sources.list.d/google-cloud-sdk.list
+    apt-get update && apt-get install -y google-cloud-cli google-cloud-cli-app-engine-java
+    
+    echo "Ensuring final correct versions of jax, jaxlib, and flax..."
+    conda run -n simpler_env pip install --no-cache-dir --upgrade \
+        jax[cuda12_pip]==0.4.20 \
+	jaxlib[cuda12_pip]==0.4.20 \
+	jax==0.4.20 \
+	jaxlib==0.4.20 \
+	flax==0.7.5
+
+    #clean up apt caches
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+%files
+    # Copy nvidia config files
+    /etc/vulkan/icd.d/nvidia_icd.json /usr/share/vulkan/icd.d/nvidia_icd.json
+    /etc/vulkan/implicit_layer.d/nvidia_layers.json /usr/share/vulkan/implicit_layer.d/nvidia_layers.json
+    /usr/share/glvnd/egl_vendor.d/10_nvidia.json /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+"simplerenv.def" 113L, 3338C
