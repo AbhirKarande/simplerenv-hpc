@@ -108,8 +108,91 @@ if "rt_1" in model_name:
   model = RT1Inference(saved_model_path=ckpt_path, policy_setup=policy_setup)
 elif "octo" in model_name:
   from simpler_env.policies.octo.octo_model import OctoInference
+  from typing import Optional
+  import jax
+  from transforms3d.euler import euler2axangle
 
-  model = OctoInference(model_type=model_name, policy_setup=policy_setup, init_rng=0)
+  class BatchedOctoInference(OctoInference):
+    def batch_step(self, image: np.ndarray, num_inferences: int, task_description: Optional[str] = None) -> list[tuple[dict[str, np.ndarray], dict[str, np.ndarray], dict]]:
+        if task_description is not None and task_description != self.task_description:
+            self.reset(task_description)
+
+        assert image.dtype == np.uint8
+        image_resized = self._resize_image(image)
+        self._add_image_to_history(image_resized)
+        images, pad_mask = self._obtain_image_history_and_mask()
+
+        # Add batch dimension and tile for multi-inference
+        images = np.tile(images[None], (num_inferences, 1, 1, 1, 1))
+        pad_mask = np.tile(pad_mask[None], (num_inferences, 1))
+
+        # Generate unique RNG keys for each inference
+        keys = jax.random.split(self.rng, num_inferences + 1)
+        self.rng = keys[0]
+        inference_keys = jax.numpy.stack(keys[1:])
+
+        input_observation = {"image_primary": images, "pad_mask": pad_mask}
+        
+        norm_raw_actions_batch, action_info_batch = self.model.sample_actions(
+            input_observation,
+            self.task,
+            rng=inference_keys,
+        )
+        
+        raw_actions_batch = norm_raw_actions_batch * self.action_std[None] + self.action_mean[None]
+
+        results = []
+        for i in range(num_inferences):
+            raw_actions = raw_actions_batch[i]  # (action_pred_horizon, action_dim)
+            
+            action_info = {k: v[i] for k, v in action_info_batch.items()}
+            
+            assert raw_actions.shape == (self.pred_action_horizon, 7)
+            if self.action_ensemble:
+                raw_actions = self.action_ensembler.ensemble_action(raw_actions)
+                raw_actions = raw_actions[None]
+
+            raw_action = {
+                "world_vector": np.array(raw_actions[0, :3]),
+                "rotation_delta": np.array(raw_actions[0, 3:6]),
+                "open_gripper": np.array(raw_actions[0, 6:7]),
+            }
+
+            action = {}
+            action["world_vector"] = raw_action["world_vector"] * self.action_scale
+            action_rotation_delta = np.asarray(raw_action["rotation_delta"], dtype=np.float64)
+            roll, pitch, yaw = action_rotation_delta
+            action_rotation_ax, action_rotation_angle = euler2axangle(roll, pitch, yaw)
+            action_rotation_axangle = action_rotation_ax * action_rotation_angle
+            action["rot_axangle"] = action_rotation_axangle * self.action_scale
+
+            if self.policy_setup == "google_robot":
+                current_gripper_action = raw_action["open_gripper"]
+                if self.previous_gripper_action is None:
+                    relative_gripper_action = np.array([0])
+                else:
+                    relative_gripper_action = self.previous_gripper_action - current_gripper_action
+                self.previous_gripper_action = current_gripper_action
+                if np.abs(relative_gripper_action) > 0.5 and not self.sticky_action_is_on:
+                    self.sticky_action_is_on = True
+                    self.sticky_gripper_action = relative_gripper_action
+                if self.sticky_action_is_on:
+                    self.gripper_action_repeat += 1
+                    relative_gripper_action = self.sticky_gripper_action
+                if self.gripper_action_repeat == self.sticky_gripper_num_repeat:
+                    self.sticky_action_is_on = False
+                    self.gripper_action_repeat = 0
+                    self.sticky_gripper_action = 0.0
+                action["gripper"] = relative_gripper_action
+            elif self.policy_setup == "widowx_bridge":
+                action["gripper"] = 2.0 * (raw_action["open_gripper"] > 0.5) - 1.0
+            
+            action["terminate_episode"] = np.array([0.0])
+            results.append((raw_action, action, action_info))
+        
+        return results
+
+  model = BatchedOctoInference(model_type=model_name, policy_setup=policy_setup, init_rng=0)
 else:
   raise ValueError(model_name)
 
@@ -239,22 +322,10 @@ for episode_id in range(50):
         image = get_image_from_maniskill2_obs_dict(env, obs) # Use single image
 
         # --- Perform multiple inferences ---
-        all_raw_actions = []
-        all_actions = []
-        all_action_infos = []
-        
-        for inference_idx in range(5):
-            try:
-                # Pass the single image (H, W, 3)
-                raw_action, action, action_info = model.step(image)
-            except ValueError:
-                # Handle models that might not return action_info
-                raw_action, action = model.step(image)
-                action_info = None
-                
-            all_raw_actions.append(raw_action)
-            all_actions.append(action)
-            all_action_infos.append(action_info)
+        results = model.batch_step(image, 5)
+        all_raw_actions = [r[0] for r in results]
+        all_actions = [r[1] for r in results]
+        all_action_infos = [r[2] for r in results]
 
         # Cleanup the image used for inference
         del image
