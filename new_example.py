@@ -8,6 +8,7 @@ from simpler_env.utils.env.observation_utils import get_image_from_maniskill2_ob
 import json
 import numpy as np
 import sapien.core as sapien
+import mediapy
 # Suppress TensorFlow warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 0=all, 1=no INFO, 2=no INFO/WARNING, 3=no INFO/WARNING/ERROR
 logging.getLogger('tensorflow').setLevel(logging.ERROR)
@@ -122,22 +123,36 @@ elif "octo" in model_name:
         self._add_image_to_history(image_resized)
         images, pad_mask = self._obtain_image_history_and_mask()
 
-        # Add batch dimension and tile for multi-inference
-        images = np.tile(images[None], (num_inferences, 1, 1, 1, 1))
-        pad_mask = np.tile(pad_mask[None], (num_inferences, 1))
+        # We will collect results for each inference in a loop.
+        all_norm_raw_actions = []
+        all_action_infos = []
 
-        # Generate unique RNG keys for each inference
-        keys = jax.random.split(self.rng, num_inferences + 1)
-        self.rng = keys[0]
-        inference_keys = jax.numpy.stack(keys[1:])
+        # Generate num_inferences keys for the loop.
+        self.rng, *keys = jax.random.split(self.rng, num_inferences + 1)
 
-        input_observation = {"image_primary": images, "pad_mask": pad_mask}
-        
-        norm_raw_actions_batch, action_info_batch = self.model.sample_actions(
-            input_observation,
-            self.task,
-            rng=inference_keys,
-        )
+        for i in range(num_inferences):
+            key = keys[i]
+            
+            # Prepare input for a single inference (batch size 1)
+            # The model expects a batch dimension.
+            input_observation = {
+                "image_primary": images[None],
+                "pad_mask": pad_mask[None]
+            }
+            
+            norm_raw_actions, action_info = self.model.sample_actions(
+                input_observation,
+                self.task, # self.task is already prepared for a single inference
+                rng=key,
+            )
+            
+            all_norm_raw_actions.append(norm_raw_actions)
+            all_action_infos.append(action_info)
+
+        # After the loop, stack the results to create batches.
+        # The model's output already has a batch dimension of 1, so we concatenate along axis 0.
+        norm_raw_actions_batch = jax.numpy.concatenate(all_norm_raw_actions, axis=0)
+        action_info_batch = jax.tree_map(lambda *xs: jax.numpy.concatenate(xs, axis=0), *all_action_infos)
         
         raw_actions_batch = norm_raw_actions_batch * self.action_std[None] + self.action_mean[None]
 
@@ -206,12 +221,11 @@ import os
 import gc
 from datetime import datetime, timedelta
 
+num_episodes = 200
 # Create a folder for all JSON files
-output_folder = "inference_results_terminated"
-os.makedirs(output_folder, exist_ok=True)
-
-# Initialize data structure to store minimal summary information
-summary_data = []
+output_dir = f"mc_dropout_{task_name}_{num_episodes}_episodes"
+os.makedirs(f"{output_dir}/json", exist_ok=True)
+os.makedirs(f"{output_dir}/video", exist_ok=True)
 
 # For logging progress
 start_time = datetime.now()
@@ -227,12 +241,12 @@ def log_progress(current_ep, total_ep, success_count):
 
     # Only log every 5 minutes or when specifically requested
     if (current_time - last_log_time).total_seconds() >= 300 or current_ep == total_ep - 1:
-        print(f"Progress: {current_ep+1}/{total_ep} episodes completed ({(current_ep+1)/total_ep*100:.1f}%)")
-        print(f"Success rate: {success_count}/{current_ep+1} ({success_count/(current_ep+1)*100:.1f}%)")
+        print(f"Progress: {current_ep+1}/{total_ep} episodes completed ({(current_ep+1)/total_ep*200:.1f}%)")
+        print(f"Success rate: {success_count}/{current_ep+1} ({success_count/(current_ep+1)*200:.1f}%)")
         print(f"Elapsed time: {elapsed:.1f} minutes")
         print(f"Estimated remaining time: {remaining:.1f} minutes")
         print(f"Estimated completion: {current_time + timedelta(minutes=remaining)}")
-        print("-" * 50)
+        print("-" * 200)
         last_log_time = current_time
 
 # Helper function to ensure all numpy arrays are converted to lists
@@ -292,8 +306,8 @@ class EnhancedJSONEncoder(json.JSONEncoder):
 success_count = 0
 
 # Run for 50 episodes
-for episode_id in range(50):
-    print(f"Running episode {episode_id+1}/50")
+for episode_id in range(num_episodes):
+    print(f"Running episode {episode_id+1}/{num_episodes}")
 
     # Reset environment for a new episode
     obs, reset_info = env.reset()
@@ -304,22 +318,20 @@ for episode_id in range(50):
         print(f"Instruction: {instruction}")
 
     # Create an episode dictionary - we'll flush this after each episode
-    episode_data = []
+    trajectory = []
+    frames = []
 
     # Track episode outcome
     success = False
-    elapsed_steps = 0
-    episode_stats = {"n_lift_significant": 0, "consec_grasp": False, "grasped": False}
 
     # Run 100 timesteps for the episode
-    for timestep in range(100):
+    for timestep in range(200):
         if timestep % 20 == 0:  # Print even less frequently to reduce clutter
             print(f"  Timestep {timestep}")
 
-        elapsed_steps += 1
-
         # Get the image (use single image now)
         image = get_image_from_maniskill2_obs_dict(env, obs) # Use single image
+        frames.append(image)
 
         # --- Perform multiple inferences ---
         results = model.batch_step(image, 5)
@@ -327,16 +339,31 @@ for episode_id in range(50):
         all_actions = [r[1] for r in results]
         all_action_infos = [r[2] for r in results]
 
+        # Verification check for MC Dropout at the first timestep
+        if timestep == 0:
+            world_vectors_for_check = np.array([a["world_vector"] for a in all_actions])
+            is_stochastic = not np.allclose(world_vectors_for_check[0], world_vectors_for_check[1], atol=1e-5)
+            if is_stochastic:
+                print("✅ Verification Passed: Model is producing stochastic outputs.")
+            else:
+                print("⚠️ Verification Failed: Model is producing deterministic outputs. MC Dropout is not active.")
+
         # Cleanup the image used for inference
         del image
-
-        # Store data for logging (convert to serializable format)
-        serializable_raw_actions = [ensure_serializable(ra) for ra in all_raw_actions]
-        serializable_actions = [ensure_serializable(a) for a in all_actions]
 
         # Extract optional info like entropy, log_probs, token_argmax for logging
         token_argmax_data = []
         token_entropy_data = []
+        
+        for action_info in all_action_infos:
+            if action_info:
+                if 'entropy' in action_info:
+                    entropy_data = ensure_serializable(action_info['entropy'])
+                    if isinstance(entropy_data, list) and len(entropy_data) > 0:
+                        first_horizon_entropies = entropy_data[0][:7]  # Take first 7 values from first horizon
+                        token_entropy_data.append(first_horizon_entropies)  # Keep existing behavior for backward compatibility
+                if 'token_argmax' in action_info:
+                    token_argmax_data.append(ensure_serializable(action_info['token_argmax']))
         
         # --- Use the averaged processed action to step Environment ---
         # Average the action components across all 5 inferences
@@ -344,169 +371,76 @@ for episode_id in range(50):
         rot_axangles = np.array([action["rot_axangle"] for action in all_actions])
         grippers = np.array([action["gripper"] for action in all_actions])
 
-        # Calculate averages
+        # Calculate averages for stepping the environment
         avg_world_vector = np.mean(world_vectors, axis=0)
         avg_rot_axangle = np.mean(rot_axangles, axis=0)
         avg_gripper = np.mean(grippers, axis=0)
 
-        # Process action info from all inferences
-        per_dimension_entropies = []  # List to store entropy for each dimension across inferences
-        
-        for action_info in all_action_infos:
-            if action_info and 'entropy' in action_info:
-                entropy_data = ensure_serializable(action_info['entropy'])
-                if isinstance(entropy_data, list) and len(entropy_data) > 0:
-                    # Get first horizon (index 0) and first 7 values (action dimensions)
-                    first_horizon_entropies = entropy_data[0][:7]  # Take first 7 values from first horizon
-                    per_dimension_entropies.append(first_horizon_entropies)
-                    token_entropy_data.append(first_horizon_entropies)  # Keep existing behavior for backward compatibility
-
-        # Calculate average entropy for each dimension across inferences
-        avg_dimension_entropies = None
-        if per_dimension_entropies:
-            # Convert to numpy array for easier averaging
-            entropy_array = np.array(per_dimension_entropies)  # Shape: (5, 7) - 5 inferences, 7 dimensions
-            avg_dimension_entropies = np.mean(entropy_array, axis=0).tolist()  # Average across inferences
+        # Calculate mean action from raw actions for logging (to match rt900k.py)
+        mean_action = {
+            "world_vector": np.mean([ra["world_vector"] for ra in all_raw_actions], axis=0),
+            "rotation_delta": np.mean([ra["rotation_delta"] for ra in all_raw_actions], axis=0),
+            "gripper_closedness_action": np.mean([ra["open_gripper"] for ra in all_raw_actions], axis=0)
+        }
 
         # Use the averaged components for the environment step
         combined_action = np.concatenate([avg_world_vector, avg_rot_axangle, avg_gripper])
         obs, reward, terminated, truncated, info = env.step(combined_action)
-
-
-
-        # Get info from environment (ensure they're Python native types)
-        is_grasped = bool(info.get("is_grasped", False))
-        consecutive_grasp = bool(info.get("consecutive_grasp", False))
-        lifted_object = bool(info.get("lifted_object", False))
-        lifted_object_significantly = bool(info.get("lifted_object_significantly", False))
         success = bool(info.get("success", False))
 
-        # Update episode stats
-        if lifted_object_significantly:
-            episode_stats["n_lift_significant"] += 1
-        if consecutive_grasp:
-            episode_stats["consec_grasp"] = True
-        if is_grasped:
-            episode_stats["grasped"] = True
-
-        # Store timestep data in the format shown in the JSON snippet
-        timestep_data = {
+        # Store timestep data in the format from rt900k.py
+        timestep_log = {
             "timestep": timestep,
-            # Store all 5 action components
-            "all_action_components": serializable_actions,
-            "all_raw_actions": serializable_raw_actions,
-            # Store the averaged action components
-            "averaged_action_components": {
-                "world_vector": ensure_serializable(avg_world_vector),
-                "rot_axangle": ensure_serializable(avg_rot_axangle),
-                "gripper": ensure_serializable(avg_gripper)
-            },
-            # Add entropy information
-            "entropy_info": {
-                "per_inference_entropies": per_dimension_entropies,  # List of entropies for each inference
-                "averaged_dimension_entropies": avg_dimension_entropies  # Average entropy for each dimension
-            },
-            "info": {
-                "elapsed_steps": elapsed_steps,
-                "is_grasped": is_grasped,
-                "consecutive_grasp": consecutive_grasp,
-                "lifted_object": lifted_object,
-                "lifted_object_significantly": lifted_object_significantly,
-                "success": success,
-                "episode_stats": episode_stats
-            }
+            "token_argmax": token_argmax_data,
+            "token_entropy": token_entropy_data,
+            "mean_action": ensure_serializable(mean_action),
+            "info": ensure_serializable(info)
         }
+        trajectory.append(timestep_log)
 
-        if token_argmax_data:
-            timestep_data["token_argmax"] = token_argmax_data
-
-        # Add the token_entropy data if available
-        if token_entropy_data:
-            timestep_data["token_entropy"] = token_entropy_data
-
-        episode_data.append(timestep_data)
-
-                # --- Cleanup action components and combined action ---
+        # --- Cleanup action components and combined action ---
         del world_vectors, rot_axangles, grippers
         del avg_world_vector, avg_rot_axangle, avg_gripper
         del combined_action
         del all_raw_actions, all_actions, all_action_infos
 
+        if terminated or truncated or success:
+            print(f"Terminated at step {timestep} with success: {success}")
+            break
 
 
     # Save this episode's data to a separate JSON file in the folder
-    episode_file_path = os.path.join(output_folder, f'episode_{episode_id}_data.json')
+    filename_prefix = f"{str(success)}_{episode_id}"
+    episode_file_path = os.path.join(output_dir, "json", f'{filename_prefix}.json')
+    video_file_path = os.path.join(output_dir, "video", f'{filename_prefix}.mp4')
+
     try:
-        # First attempt with our enhanced encoder
         with open(episode_file_path, 'w') as f:
-            json.dump(episode_data, f, cls=EnhancedJSONEncoder)
-    except TypeError as e:
-        # If still having issues, try additional serialization steps
-        print(f"Error serializing JSON: {e}")
-        print("Attempting to fix serialization issues...")
-
-        # Convert all objects in episode_data to ensure they're serializable
-        safe_episode_data = []
-        for timestep_data in episode_data:
-            # Process each timestep separately
-            try:
-                safe_timestep = ensure_serializable(timestep_data)
-                safe_episode_data.append(safe_timestep)
-            except Exception as e2:
-                print(f"Error processing timestep data: {e2}")
-                # Create a simplified version of the timestep data
-                safe_timestep = {
-                    "timestep": timestep_data.get("timestep", 0),
-                    "info": {
-                        "error": f"Failed to serialize full data: {str(e2)}",
-                        "success": timestep_data.get("info", {}).get("success", False)
-                    }
-                }
-                safe_episode_data.append(safe_timestep)
-
-        # Try to save the sanitized data
-        try:
-            with open(episode_file_path, 'w') as f:
-                json.dump(safe_episode_data, f)
-        except Exception as e3:
-            print(f"Critical error saving episode data: {e3}")
-            # Last resort: save what we can
-            with open(episode_file_path, 'w') as f:
-                f.write('{"error": "Failed to serialize episode data"}')
+            json.dump(trajectory, f, cls=EnhancedJSONEncoder, indent=2)
+        mediapy.write_video(video_file_path, frames, fps=10)
+    except Exception as e:
+        print(f"Error saving episode data or video: {e}")
 
     # Free memory by clearing episode data
-    del episode_data
+    del trajectory
+    del frames
 
     # Update success count if this episode was successful
     if success:
         success_count += 1
 
-    # Add minimal info to summary
-    summary_data.append({
-        "episode_id": episode_id,
-        "success": success,
-        "steps_taken": elapsed_steps
-    })
-
     # Log progress
-    if episode_id % 10 == 0 or episode_id == 49:
-        log_progress(episode_id, 50, success_count)
+    if (episode_id + 1) % 10 == 0 or episode_id == num_episodes - 1:
+        log_progress(episode_id, num_episodes, success_count)
 
     # Explicitly run garbage collection between episodes
     gc.collect()
 
-# Save summary data in the same folder (smaller file, can use indentation)
-summary_file_path = os.path.join(output_folder, 'episodes_summary.json')
-with open(summary_file_path, 'w') as f:
-    json.dump(summary_data, f, indent=2, cls=EnhancedJSONEncoder)
-
 # Final stats
 total_elapsed = (datetime.now() - start_time).total_seconds() / 60
-print(f"Completed 50 episodes in {total_elapsed:.1f} minutes")
-print(f"Data saved to {output_folder}/ folder")
-print(f"Total successful episodes: {success_count}/50 ({success_count/50*100:.1f}%)")
-print(f"Average steps taken: {np.mean([ep['steps_taken'] for ep in summary_data]):.2f}")
+print(f"Completed {num_episodes} episodes in {total_elapsed:.1f} minutes")
+print(f"Data saved to {output_dir}/ folder")
+print(f"Total successful episodes: {success_count}/{num_episodes} ({success_count/num_episodes*100:.1f}%)")
 
 # Clear any remaining references to large data structures
-del summary_data
 gc.collect()
